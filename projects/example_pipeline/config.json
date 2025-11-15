@@ -1,0 +1,101 @@
+{
+    "pipeline_metadata": {
+        "pipeline_name": "example_pipeline",
+        "pipeline_description": "Example data pipeline from Elasticsearch to Snowflake CDW",
+        "owner_name": "Data Engineering Team",
+        "owner_email": "data-team@company.com",
+        "notification_emails": [
+            "data-team@company.com",
+            "alerts@company.com"
+        ],
+        "slack_channel": "#data-pipeline-alerts"
+    },
+    "dag_schedule": {
+        "frequency": "hourly",
+        "cron_expression": "0 * * * *",
+        "timezone": "UTC",
+        "start_date": "2025-11-15",
+        "catchup": false
+    },
+    "query_window": {
+        "type": "hourly",
+        "duration": "1h"
+    },
+    "source_system": {
+        "type": "elasticsearch",
+        "endpoint": "https://elasticsearch.company.com:9200",
+        "index": "example_data_v1",
+        "query_field": "@timestamp",
+        "batch_size": 5000
+    },
+    "stage_system": {
+        "type": "snowflake",
+        "database": "CADS_DB",
+        "schema": "stg_example_pipeline",
+        "table": "example_stage",
+        "temp_table_prefix": "temp_example_"
+    },
+    "target_system": {
+        "type": "snowflake",
+        "database": "CDW_DB",
+        "schema": "prod_example_pipeline",
+        "table": "example_target"
+    },
+    "phases": {
+        "stale_pipeline_handling": {
+            "enabled": true,
+            "expected_run_duration": "30s",
+            "timeout_minutes": 120
+        },
+        "pre_validation": {
+            "enabled": true,
+            "expected_run_duration": "1m"
+        },
+        "source_to_stage_transfer": {
+            "enabled": true,
+            "expected_run_duration": "10m"
+        },
+        "stage_to_target_transfer": {
+            "enabled": true,
+            "expected_run_duration": "5m"
+        },
+        "audit": {
+            "enabled": true,
+            "expected_run_duration": "2m",
+            "count_tolerances": {
+                "source_to_stage_tolerance_percent": 2.0,
+                "stage_to_target_tolerance_percent": 1.0
+            }
+        },
+        "stage_cleaning": {
+            "enabled": true,
+            "expected_run_duration": "3m",
+            "archive_before_delete": true,
+            "archive_location": "s3://company-archive/example_pipeline/",
+            "delete_after_days": 7
+        },
+        "target_cleaning": {
+            "enabled": false,
+            "expected_run_duration": "5m",
+            "description": "Optional target cleanup - disabled by default"
+        }
+    },
+    "retry_configuration": {
+        "max_retries": 3,
+        "backoff_strategy": "exponential"
+    },
+    "monitoring": {
+        "alert_on_failure": true,
+        "alert_on_duration_exceed": true,
+        "duration_multiplier_threshold": 2.0
+    },
+    "snowflake_connection": {
+        "user": "PIPELINE_SERVICE_ACCOUNT",
+        "password": "${SNOWFLAKE_PASSWORD}",
+        "account": "your_account",
+        "warehouse": "PIPELINE_WH",
+        "database": "CADS_DB",
+        "schema": "PIPELINE_TRACKING",
+        "role": "PIPELINE_ROLE"
+    }
+}
