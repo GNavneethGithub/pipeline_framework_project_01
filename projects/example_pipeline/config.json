@@ -19,6 +19,10 @@
     },
     "query_window": {
         "type": "hourly",
+        "granularity": "1h",
+        "x_days_back": "7d",
+        "acceptable_data_fetch_start_time": "2025-01-01T00:00:00+00:00",
+        "acceptable_data_fetch_end_time": null,
         "duration": "1h"
     },
     "source_system": {

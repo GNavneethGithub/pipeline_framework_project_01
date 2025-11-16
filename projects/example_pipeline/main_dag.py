@@ -25,7 +25,8 @@ from framework_scripts import (
     phase_executor,
     snowflake_operations as sf_ops,
     connectivity_checker,
-    alerting
+    alerting,
+    query_window_calculator as qw_calc
 )
 from config_handler_scripts import config_loader
 
@@ -90,26 +91,22 @@ def get_query_window(execution_date: datetime) -> tuple:
     """
     Calculate query window based on execution date and config.
 
+    This function now uses the query_window_calculator module to:
+    - Calculate windows with granularity and x_days_back constraints
+    - Validate against acceptable_data_fetch boundaries
+    - Ensure proper continuity by rounding to granularity
+
     Args:
         execution_date: Airflow execution date
 
     Returns:
         tuple: (window_start, window_end)
     """
-    query_window_config = config.get('query_window', {})
-    window_type = query_window_config.get('type', 'hourly')
-    duration = query_window_config.get('duration', '1h')
-
-    if window_type == 'hourly' or duration == '1h':
-        window_start = execution_date
-        window_end = execution_date + timedelta(hours=1)
-    elif window_type == 'daily' or duration == '1d' or duration == '24h':
-        window_start = execution_date.replace(hour=0, minute=0, second=0)
-        window_end = window_start + timedelta(days=1)
-    else:
-        # Default to hourly
-        window_start = execution_date
-        window_end = execution_date + timedelta(hours=1)
+    # Use the new query window calculator
+    window_start, window_end = qw_calc.calculate_query_window(
+        config=config,
+        current_time=execution_date
+    )
 
     return window_start, window_end
 
@@ -151,6 +148,77 @@ def check_connectivity(**context):
     return result
 
 
+def calculate_and_validate_query_window(**context):
+    """
+    Calculate query window and detect gaps.
+
+    This task:
+    1. Calculates the next query window based on config constraints
+    2. Detects gaps between last completed run and current window
+    3. Sends alerts and creates drive table entries for gaps
+    4. Stores query window in XCom for downstream tasks
+
+    If gaps are detected, they are logged and recorded but do not stop the DAG.
+    """
+    execution_date = context['execution_date']
+
+    logger.info("=" * 80)
+    logger.info("Calculating query window and detecting gaps...")
+    logger.info("=" * 80)
+
+    # Calculate query window
+    try:
+        window_start, window_end = get_query_window(execution_date)
+
+        logger.info(f"Query window calculated:")
+        logger.info(f"  Start: {window_start}")
+        logger.info(f"  End:   {window_end}")
+
+        # Store in XCom for downstream tasks
+        context['task_instance'].xcom_push(key='query_window_start', value=window_start.isoformat())
+        context['task_instance'].xcom_push(key='query_window_end', value=window_end.isoformat())
+
+    except Exception as e:
+        error_message = f"Failed to calculate query window: {str(e)}"
+        logger.error(error_message)
+        alerting.alerting_func(config, error_message)
+        raise Exception(error_message)
+
+    # Detect and handle gaps
+    try:
+        query_window_config = config.get('query_window', {})
+        granularity_str = query_window_config.get('granularity', '1h')
+        granularity = qw_calc.parse_time_duration(granularity_str)
+
+        gap_result = qw_calc.handle_gaps(
+            config=config,
+            next_window_start=window_start,
+            granularity=granularity
+        )
+
+        if gap_result['gap_detected']:
+            logger.warning(f"Gap detected! {gap_result['gap_count']} intervals missing")
+            logger.warning(f"Created {len(gap_result['drive_table_entries_created'])} drive table entries for gaps")
+        else:
+            logger.info("No gaps detected. Pipeline continuity maintained.")
+
+        # Store gap result in XCom
+        context['task_instance'].xcom_push(key='gap_result', value=gap_result)
+
+    except Exception as e:
+        # Log but don't fail the DAG - gap detection is informational
+        logger.error(f"Gap detection failed: {str(e)}")
+        logger.warning("Continuing with pipeline execution despite gap detection failure")
+
+    logger.info("=" * 80)
+
+    return {
+        'query_window_start': window_start,
+        'query_window_end': window_end,
+        'gap_result': gap_result if 'gap_result' in locals() else None
+    }
+
+
 def initialize_pipeline(**context):
     """Initialize pipeline execution in drive table."""
     execution_date = context['execution_date']
@@ -162,8 +230,21 @@ def initialize_pipeline(**context):
     pipeline_id = get_pipeline_id(execution_date)
     logger.info(f"Pipeline ID: {pipeline_id}")
 
-    # Get query window
-    window_start, window_end = get_query_window(execution_date)
+    # Get query window from XCom (calculated in previous task)
+    window_start_str = context['task_instance'].xcom_pull(
+        task_ids='calculate_query_window',
+        key='query_window_start'
+    )
+    window_end_str = context['task_instance'].xcom_pull(
+        task_ids='calculate_query_window',
+        key='query_window_end'
+    )
+
+    # Convert back to datetime
+    from datetime import datetime
+    window_start = datetime.fromisoformat(window_start_str)
+    window_end = datetime.fromisoformat(window_end_str)
+
     logger.info(f"Query window: {window_start} to {window_end}")
 
     # Initialize in drive table
@@ -261,6 +342,14 @@ with DAG(
         on_failure_callback=failure_callback
     )
 
+    # Calculate query window and detect gaps
+    calculate_query_window_task = PythonOperator(
+        task_id='calculate_query_window',
+        python_callable=calculate_and_validate_query_window,
+        provide_context=True,
+        on_failure_callback=failure_callback
+    )
+
     # Initialize pipeline
     init_task = PythonOperator(
         task_id='initialize_pipeline',
@@ -341,8 +430,8 @@ with DAG(
     )
 
     # Define task dependencies
-    # First check connectivity, then initialize, then run phases
-    connectivity_check_task >> init_task >> stale_handling_task >> pre_validation_task
+    # First check connectivity, then calculate query window and detect gaps, then initialize, then run phases
+    connectivity_check_task >> calculate_query_window_task >> init_task >> stale_handling_task >> pre_validation_task
     pre_validation_task >> source_to_stage_task >> stage_to_target_task
     stage_to_target_task >> audit_task
     audit_task >> stage_cleaning_task >> target_cleaning_task
