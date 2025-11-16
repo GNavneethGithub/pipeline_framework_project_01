@@ -79,7 +79,8 @@ def flatten_dict(
 
 def replace_placeholders(
     flattened_dict: Dict[str, Any],
-    max_iterations: int = 10
+    max_iterations: int = 10,
+    lookup_dict: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
     Replace {placeholder} patterns in values with actual values from the dictionary.
@@ -90,6 +91,8 @@ def replace_placeholders(
     Args:
         flattened_dict: Flattened dictionary with potential placeholders
         max_iterations: Maximum number of replacement passes (prevents infinite loops)
+        lookup_dict: Optional separate dictionary to use for looking up placeholder values.
+                     If not provided, uses flattened_dict itself for lookups.
 
     Returns:
         dict: Dictionary with all placeholders replaced
@@ -110,6 +113,8 @@ def replace_placeholders(
         }
     """
     result = flattened_dict.copy()
+    # Use lookup_dict if provided, otherwise use result itself
+    lookup_source = lookup_dict if lookup_dict is not None else result
     placeholder_pattern = re.compile(r'\{([^}]+)\}')
 
     # Perform multiple passes to resolve nested placeholders
@@ -122,15 +127,15 @@ def replace_placeholders(
                 matches = placeholder_pattern.findall(value)
 
                 for placeholder in matches:
-                    # Look for the placeholder value in the flattened dict
+                    # Look for the placeholder value in the lookup source
                     # Try exact match first
                     replacement_value = None
 
-                    if placeholder in result:
-                        replacement_value = result[placeholder]
+                    if placeholder in lookup_source:
+                        replacement_value = lookup_source[placeholder]
                     else:
                         # Try searching for the placeholder in any key ending with it
-                        for dict_key, dict_value in result.items():
+                        for dict_key, dict_value in lookup_source.items():
                             if dict_key.endswith(f"_{placeholder}") or dict_key == placeholder:
                                 replacement_value = dict_value
                                 break
@@ -154,10 +159,10 @@ def replace_placeholders(
                         for placeholder in matches:
                             replacement_value = None
 
-                            if placeholder in result:
-                                replacement_value = result[placeholder]
+                            if placeholder in lookup_source:
+                                replacement_value = lookup_source[placeholder]
                             else:
-                                for dict_key, dict_value in result.items():
+                                for dict_key, dict_value in lookup_source.items():
                                     if dict_key.endswith(f"_{placeholder}") or dict_key == placeholder:
                                         replacement_value = dict_value
                                         break
@@ -188,14 +193,21 @@ def apply_extra_dicts(
     extra_dicts: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Merge extra dictionaries and perform placeholder replacement again.
+    Merge extra dictionaries and use them to resolve remaining placeholders.
 
-    This allows users to add custom key-value pairs and have placeholders
-    resolved using both the original config and the extra values.
+    IMPORTANT: extra_dicts are treated as FINAL VALUES and are NOT processed
+    for placeholder replacement. This is critical because extra_dicts typically
+    contain credentials (username, password) that may include special characters
+    like {, }, [, ] which should NOT be treated as placeholders.
+
+    The function:
+    1. Uses extra_dicts as a lookup source to resolve placeholders in processed_dict
+    2. Merges extra_dicts as-is (without any placeholder processing)
+    3. Returns the final combined dictionary
 
     Args:
         processed_dict: Already processed configuration dictionary
-        extra_dicts: Additional key-value pairs to merge
+        extra_dicts: Additional key-value pairs to merge (treated as final values)
 
     Returns:
         dict: Final dictionary with extra values merged and placeholders replaced
@@ -203,28 +215,42 @@ def apply_extra_dicts(
     Example:
         >>> config = {
         ...     'elasticsearch_index_new_name': 'completed_jobs',
-        ...     'snowflake_raw_database': 'db_completed_jobs'
+        ...     'snowflake_raw_database': 'db_{username}_{env}',
+        ...     'connection_string': 'host={db_host};user={username};pwd={password}'
         ... }
         >>> extra = {
         ...     'env': 'production',
-        ...     'custom_prefix': 'pipeline_{env}_{index_new_name}'
+        ...     'username': 'admin{special}',  # Contains { and } but NOT a placeholder
+        ...     'password': 'P@ss[w0rd]!',     # Contains [ and ]
+        ...     'db_host': 'localhost'
         ... }
         >>> apply_extra_dicts(config, extra)
         {
             'elasticsearch_index_new_name': 'completed_jobs',
-            'snowflake_raw_database': 'db_completed_jobs',
+            'snowflake_raw_database': 'db_admin{special}_production',
+            'connection_string': 'host=localhost;user=admin{special};pwd=P@ss[w0rd]!',
             'env': 'production',
-            'custom_prefix': 'pipeline_production_completed_jobs'
+            'username': 'admin{special}',
+            'password': 'P@ss[w0rd]!',
+            'db_host': 'localhost'
         }
     """
-    # Merge extra_dicts into processed_dict
-    result = processed_dict.copy()
+    # Create a combined lookup dictionary (processed_dict + extra_dicts)
+    # This will be used to resolve placeholders in processed_dict
+    lookup_combined = processed_dict.copy()
+    lookup_combined.update(extra_dicts)
+
+    logger.info(f"Processing with {len(extra_dicts)} extra key-value pair(s)")
+
+    # Replace placeholders in processed_dict using the combined lookup
+    # This resolves any placeholders that reference keys in extra_dicts
+    result = replace_placeholders(processed_dict, lookup_dict=lookup_combined)
+
+    # Now merge extra_dicts as-is (WITHOUT any placeholder replacement)
+    # This preserves special characters in credentials
     result.update(extra_dicts)
 
-    logger.info(f"Merged {len(extra_dicts)} extra key-value pair(s)")
-
-    # Perform another round of placeholder replacement
-    result = replace_placeholders(result)
+    logger.info(f"Final config contains {len(result)} key-value pairs")
 
     return result
 
@@ -353,23 +379,34 @@ if __name__ == "__main__":
     for key, value in sorted(processed.items()):
         print(f"  {key}: {value}")
 
-    # Example 3: Apply extra dicts
-    print("\n3. EXTRA DICTS EXAMPLE")
+    # Example 3: Apply extra dicts with credentials containing special characters
+    print("\n3. EXTRA DICTS EXAMPLE (WITH CREDENTIALS)")
     print("-" * 80)
+
+    # Add some placeholders that will be resolved by extra_dicts
+    processed["database_connection"] = "host={db_host};user={username};pwd={password}"
+    processed["snowflake_warehouse"] = "wh_{env}_{index_new_name}"
 
     extra = {
         "env": "production",
         "region": "us-east-1",
-        "custom_bucket": "custom_{env}_{region}",
-        "full_prefix": "{env}_{index_new_name}_data"
+        "username": "admin{special}",  # Contains { and } - NOT a placeholder!
+        "password": "P@ss[w0rd]!{123}",  # Contains special chars - NOT a placeholder!
+        "db_host": "db-prod.example.com",
+        "api_key": "key_{with}_[brackets]"  # Contains {, }, [ and ] - NOT placeholders!
     }
 
-    print("Extra dictionaries to merge:")
+    print("Extra dictionaries to merge (with credentials containing special chars):")
     for key, value in extra.items():
         print(f"  {key}: {value}")
 
+    print("\nBefore applying extra_dicts, config has placeholders:")
+    print(f"  database_connection: {processed['database_connection']}")
+    print(f"  snowflake_warehouse: {processed['snowflake_warehouse']}")
+
     final = apply_extra_dicts(processed, extra)
     print("\nFinal config after merging extra dicts:")
+    print("  ** Notice: Credentials keep their special characters! **")
     for key, value in sorted(final.items()):
         print(f"  {key}: {value}")
 
@@ -400,17 +437,25 @@ The config handler provides three main functions:
    - Flattens nested JSON into single-level dict
    - Keys are joined with underscores (e.g., 'parent_child_grandchild')
 
-2. replace_placeholders(flattened_dict)
+2. replace_placeholders(flattened_dict, lookup_dict=None)
    - Replaces {placeholder} patterns with actual values
    - Handles nested placeholders through multiple passes
    - Works with both string values and lists
+   - Optional lookup_dict for using separate dictionary as value source
 
 3. apply_extra_dicts(processed_dict, extra_dicts)
-   - Merges custom key-value pairs into config
-   - Performs another round of placeholder replacement
-   - Allows for custom modifications
+   - Uses extra_dicts to resolve remaining placeholders in processed_dict
+   - IMPORTANT: extra_dicts values are NOT processed for placeholders
+   - This preserves special characters ({, }, [, ]) in credentials
+   - Merges extra_dicts as final values into the result
 
 Main function: load_and_process_config(root_path, config_path, extra_dicts)
    - Orchestrates the entire process
    - Returns fully processed configuration dictionary
+
+IMPORTANT NOTES:
+   - extra_dicts typically contain credentials (username, password, API keys)
+   - Credentials may contain special characters like {, }, [, ]
+   - These characters are preserved and NOT treated as placeholders
+   - extra_dicts are used to resolve placeholders but are not processed themselves
     """)
