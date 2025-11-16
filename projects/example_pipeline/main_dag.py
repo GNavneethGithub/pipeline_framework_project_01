@@ -21,7 +21,12 @@ from airflow.utils.dates import days_ago
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from framework_scripts import phase_executor, snowflake_operations as sf_ops
+from framework_scripts import (
+    phase_executor,
+    snowflake_operations as sf_ops,
+    connectivity_checker,
+    alerting
+)
 from config_handler_scripts import config_loader
 
 
@@ -113,6 +118,39 @@ def get_query_window(execution_date: datetime) -> tuple:
 # TASK FUNCTIONS
 # ============================================================================
 
+def check_connectivity(**context):
+    """
+    Check connectivity to all required systems before starting the pipeline.
+
+    This task checks connectivity to:
+    - Snowflake
+    - Source system
+    - Stage area
+    - Target system
+
+    If any connectivity check fails, the DAG will be stopped.
+    """
+    logger.info("Checking connectivity to all required systems...")
+
+    # Run connectivity checks
+    result = connectivity_checker.check_all_connections(config)
+
+    # Check if we should skip the DAG run
+    if result.get('skip_dag_run', False):
+        error_message = result.get('error_message', 'Connectivity check failed')
+        logger.error(f"Connectivity check failed. Stopping DAG.")
+        logger.error(error_message)
+
+        # Send alert
+        alerting.alerting_func(config, error_message)
+
+        # Raise exception to stop DAG (Airflow will show this error)
+        raise Exception(f"Connectivity check failed:\n{error_message}")
+
+    logger.info("All connectivity checks passed. Proceeding with pipeline.")
+    return result
+
+
 def initialize_pipeline(**context):
     """Initialize pipeline execution in drive table."""
     execution_date = context['execution_date']
@@ -203,6 +241,9 @@ def finalize_pipeline(**context):
 # DAG DEFINITION
 # ============================================================================
 
+# Get failure callback function
+failure_callback = alerting.get_alerting_callback(config)
+
 with DAG(
     dag_id=f'pipeline_{pipeline_name}',
     default_args=default_args,
@@ -212,11 +253,20 @@ with DAG(
     tags=['data_pipeline', pipeline_name]
 ) as dag:
 
+    # Check connectivity to all required systems
+    connectivity_check_task = PythonOperator(
+        task_id='check_connectivity',
+        python_callable=check_connectivity,
+        provide_context=True,
+        on_failure_callback=failure_callback
+    )
+
     # Initialize pipeline
     init_task = PythonOperator(
         task_id='initialize_pipeline',
         python_callable=initialize_pipeline,
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 1: Stale Pipeline Handling
@@ -224,7 +274,8 @@ with DAG(
         task_id='stale_pipeline_handling',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'stale_pipeline_handling'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 2: Pre-Validation
@@ -232,7 +283,8 @@ with DAG(
         task_id='pre_validation',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'pre_validation'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 3-4: Source to Stage Transfer
@@ -240,7 +292,8 @@ with DAG(
         task_id='source_to_stage_transfer',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'source_to_stage_transfer'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 5-6: Stage to Target Transfer
@@ -248,7 +301,8 @@ with DAG(
         task_id='stage_to_target_transfer',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'stage_to_target_transfer'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 7: Audit
@@ -256,7 +310,8 @@ with DAG(
         task_id='audit',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'audit'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 8: Stage Cleaning
@@ -264,7 +319,8 @@ with DAG(
         task_id='stage_cleaning',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'stage_cleaning'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Phase 9: Target Cleaning (optional)
@@ -272,18 +328,21 @@ with DAG(
         task_id='target_cleaning',
         python_callable=execute_phase,
         op_kwargs={'phase_name': 'target_cleaning'},
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Finalize
     finalize_task = PythonOperator(
         task_id='finalize_pipeline',
         python_callable=finalize_pipeline,
-        provide_context=True
+        provide_context=True,
+        on_failure_callback=failure_callback
     )
 
     # Define task dependencies
-    init_task >> stale_handling_task >> pre_validation_task
+    # First check connectivity, then initialize, then run phases
+    connectivity_check_task >> init_task >> stale_handling_task >> pre_validation_task
     pre_validation_task >> source_to_stage_task >> stage_to_target_task
     stage_to_target_task >> audit_task
     audit_task >> stage_cleaning_task >> target_cleaning_task
