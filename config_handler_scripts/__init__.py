@@ -6,6 +6,7 @@ Configuration management for pipeline framework.
 Modules:
     - config_loader: Load and access configuration
     - config_validator: Validate configuration correctness
+    - config_handler: Flatten and process configurations with placeholder replacement
 """
 
 from config_handler_scripts.config_loader import (
@@ -29,6 +30,13 @@ from config_handler_scripts.config_validator import (
     create_config_template
 )
 
+from config_handler_scripts.config_handler import (
+    flatten_dict,
+    replace_placeholders,
+    apply_extra_dicts,
+    load_and_process_config
+)
+
 __all__ = [
     # config_loader
     'load_config',
@@ -48,6 +56,12 @@ __all__ = [
     'validate_tolerances',
     'validate_required_fields',
     'create_config_template',
+
+    # config_handler
+    'flatten_dict',
+    'replace_placeholders',
+    'apply_extra_dicts',
+    'load_and_process_config',
 ]
 
 __version__ = '1.0.0'

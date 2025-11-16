@@ -1,0 +1,22 @@
+{
+  "elasticsearch": {
+    "index_old_name": "lsf_x",
+    "index_new_name": "completed_jobs"
+  },
+  "aws": {
+    "aws_s3_bucket": "bucket_x",
+    "prefix_list": [
+      "pipeline_x_{env}",
+      "{index_new_name}",
+      "{index_old_name}"
+    ]
+  },
+  "snowflake": {
+    "raw_database": "db_{index_new_name}",
+    "raw_schema": "sch_{index_new_name}",
+    "raw_table": "{index_old_name}_tbl",
+    "drive_database": "db_drive",
+    "drive_schema": "sch_drive",
+    "drive_tbl": "pipeline_drive_tbl"
+  }
+}
